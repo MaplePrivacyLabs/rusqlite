@@ -31,6 +31,19 @@ macro_rules! cfg_select {
 #[cfg(all(feature = "loadable_extension", feature = "preupdate_hook"))]
 compile_error!("feature \"loadable_extension\" and feature \"preupdate_hook\" cannot be enabled at the same time");
 
+// Maple's shipping route cannot be redirected to an ambient SQLite or OpenSSL.
+#[cfg(all(
+    feature = "bundled-sqlcipher-openssl4",
+    any(
+        feature = "bundled-sqlcipher-vendored-openssl",
+        feature = "loadable_extension",
+        feature = "in_gecko"
+    )
+))]
+compile_error!(
+    "bundled-sqlcipher-openssl4 requires the bundled source route without another crypto provider"
+);
+
 /// Tells whether we're building for Windows. This is more suitable than a plain
 /// `cfg!(windows)`, since the latter does not properly handle cross-compilation
 ///
@@ -67,6 +80,11 @@ fn copy_bindings<T: AsRef<Path>>(dir: &str, bindgen_name: &str, out_path: T) {
 }
 
 fn main() {
+    if cfg!(feature = "bundled-sqlcipher-openssl4")
+        && env::var_os("LIBSQLITE3_SYS_USE_PKG_CONFIG").is_some_and(|s| s != "0")
+    {
+        panic!("bundled-sqlcipher-openssl4 cannot use LIBSQLITE3_SYS_USE_PKG_CONFIG");
+    }
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {
@@ -122,8 +140,11 @@ fn main() {
 ))]
 mod build_bundled {
     use std::env;
+    #[cfg(not(feature = "bundled-sqlcipher-openssl4"))]
     use std::ffi::OsString;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(not(feature = "bundled-sqlcipher-openssl4"))]
+    use std::path::PathBuf;
 
     use super::{is_compiler, win_target};
 
@@ -134,21 +155,39 @@ mod build_bundled {
         assert!(!(cfg!(feature = "bundled-windows") && !cfg!(feature = "bundled") && !win_target()),
             "This module should not be used: we're not on Windows and the bundled feature has not been enabled");
 
+        // Backport of rusqlite#1917: select both the source and header before bindgen.
+        let (include_dir, source) = cfg_select! {
+            feature = "bundled-sqlcipher" => {
+                assert_eq!(sqlcipher_src::SQLCIPHER_VERSION, "4.20.0");
+                assert_eq!(sqlcipher_src::SQLITE_VERSION, "3.54.1");
+                let dir = sqlcipher_src::source_dir();
+                (dir.to_owned(), dir.join(sqlcipher_src::SOURCE_FILE))
+            }
+            _ => {
+                let dir = format!("{}/{lib_name}", env!("CARGO_MANIFEST_DIR"));
+                (PathBuf::from(dir), PathBuf::from(format!("{lib_name}/sqlite3.c")))
+            }
+        };
+
         cfg_select! {
             feature = "buildtime_bindgen" => {
                 use super::{HeaderLocation, bindings};
-                let header = HeaderLocation::FromPath(lib_name.to_owned());
+                let header = HeaderLocation::FromPath(include_dir.to_string_lossy().into());
                 bindings::write_to_out_dir(header, out_path);
             }
             _ => {
                 super::copy_bindings(lib_name, "bindgen_bundled_version", out_path);
             }
         }
-        println!("cargo:include={}/{lib_name}", env!("CARGO_MANIFEST_DIR"));
-        println!("cargo:rerun-if-changed={lib_name}/sqlite3.c");
+        println!("cargo:include={}", include_dir.display());
+        println!("cargo:rerun-if-changed={}", source.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            include_dir.join("sqlite3.h").display()
+        );
         println!("cargo:rerun-if-changed=sqlite3/wasm32-wasi-vfs.c");
         let mut cfg = cc::Build::new();
-        cfg.file(format!("{lib_name}/sqlite3.c"))
+        cfg.file(&source)
             .flag("-DSQLITE_CORE")
             .flag("-DSQLITE_DEFAULT_FOREIGN_KEYS=1")
             .flag("-DSQLITE_ENABLE_API_ARMOR")
@@ -170,6 +209,9 @@ mod build_bundled {
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
 
+        #[cfg(feature = "bundled-sqlcipher-openssl4")]
+        let openssl_artifacts = openssl_src::Build::new().build();
+
         if cfg!(feature = "bundled-sqlcipher") {
             cfg.flag("-DSQLITE_HAS_CODEC")
                 .flag("-DSQLITE_TEMP_STORE=2")
@@ -177,79 +219,87 @@ mod build_bundled {
                 .flag("-DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown")
                 .flag("-DHAVE_STDINT_H=1");
 
-            let target = env::var("TARGET").unwrap();
-            let host = env::var("HOST").unwrap();
+            #[cfg(feature = "bundled-sqlcipher-openssl4")]
+            {
+                cfg.flag("-DSQLCIPHER_CRYPTO_OPENSSL")
+                    .include(openssl_artifacts.include_dir());
+            }
+            #[cfg(not(feature = "bundled-sqlcipher-openssl4"))]
+            {
+                let target = env::var("TARGET").unwrap();
+                let host = env::var("HOST").unwrap();
 
-            let is_windows = host.contains("windows") && target.contains("windows");
-            let is_apple = host.contains("apple") && target.contains("apple");
+                let is_windows = host.contains("windows") && target.contains("windows");
+                let is_apple = host.contains("apple") && target.contains("apple");
 
-            let lib_dir = env("OPENSSL_LIB_DIR").map(PathBuf::from);
-            let inc_dir = env("OPENSSL_INCLUDE_DIR").map(PathBuf::from);
-            let mut use_openssl = false;
+                let lib_dir = env("OPENSSL_LIB_DIR").map(PathBuf::from);
+                let inc_dir = env("OPENSSL_INCLUDE_DIR").map(PathBuf::from);
+                let mut use_openssl = false;
 
-            let (lib_dir, inc_dir) = match (lib_dir, inc_dir) {
-                (Some(lib_dir), Some(inc_dir)) => {
-                    use_openssl = true;
-                    (vec![lib_dir], inc_dir)
-                }
-                (lib_dir, inc_dir) => match find_openssl_dir(&host, &target) {
-                    None => {
-                        if is_windows && !cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
-                            panic!("Missing environment variable OPENSSL_DIR or OPENSSL_DIR is not set")
-                        } else {
-                            (vec![PathBuf::new()], PathBuf::new())
-                        }
-                    }
-                    Some(openssl_dir) => {
-                        let lib_dir = lib_dir.map(|d| vec![d]).unwrap_or_else(|| {
-                            let mut lib_dirs = vec![];
-                            // OpenSSL 3.0 now puts its libraries in lib64/ by default,
-                            // check for both it and lib/.
-                            if openssl_dir.join("lib64").exists() {
-                                lib_dirs.push(openssl_dir.join("lib64"));
-                            }
-                            if openssl_dir.join("lib").exists() {
-                                lib_dirs.push(openssl_dir.join("lib"));
-                            }
-                            lib_dirs
-                        });
-                        let inc_dir = inc_dir.unwrap_or_else(|| openssl_dir.join("include"));
-
-                        if !lib_dir.iter().all(|p| p.exists()) {
-                            panic!("OpenSSL library directory does not exist: {lib_dir:?}");
-                        }
-
-                        if !Path::new(&inc_dir).exists() {
-                            panic!(
-                                "OpenSSL include directory does not exist: {}",
-                                inc_dir.to_string_lossy()
-                            );
-                        }
-
+                let (lib_dir, inc_dir) = match (lib_dir, inc_dir) {
+                    (Some(lib_dir), Some(inc_dir)) => {
                         use_openssl = true;
-                        (lib_dir, inc_dir)
+                        (vec![lib_dir], inc_dir)
                     }
-                },
-            };
+                    (lib_dir, inc_dir) => match find_openssl_dir(&host, &target) {
+                        None => {
+                            if is_windows && !cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
+                                panic!("Missing environment variable OPENSSL_DIR or OPENSSL_DIR is not set")
+                            } else {
+                                (vec![PathBuf::new()], PathBuf::new())
+                            }
+                        }
+                        Some(openssl_dir) => {
+                            let lib_dir = lib_dir.map(|d| vec![d]).unwrap_or_else(|| {
+                                let mut lib_dirs = vec![];
+                                // OpenSSL 3.0 now puts its libraries in lib64/ by default,
+                                // check for both it and lib/.
+                                if openssl_dir.join("lib64").exists() {
+                                    lib_dirs.push(openssl_dir.join("lib64"));
+                                }
+                                if openssl_dir.join("lib").exists() {
+                                    lib_dirs.push(openssl_dir.join("lib"));
+                                }
+                                lib_dirs
+                            });
+                            let inc_dir = inc_dir.unwrap_or_else(|| openssl_dir.join("include"));
 
-            if cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
-                cfg.include(env::var("DEP_OPENSSL_INCLUDE").unwrap());
-                // cargo will resolve downstream to the static lib in
-                // openssl-sys
-            } else if use_openssl {
-                cfg.include(inc_dir.to_string_lossy().as_ref());
-                let lib_name = if is_windows { "libcrypto" } else { "crypto" };
-                println!("cargo:rustc-link-lib=dylib={lib_name}");
-                for lib_dir_item in &lib_dir {
-                    println!("cargo:rustc-link-search={}", lib_dir_item.to_string_lossy());
+                            if !lib_dir.iter().all(|p| p.exists()) {
+                                panic!("OpenSSL library directory does not exist: {lib_dir:?}");
+                            }
+
+                            if !Path::new(&inc_dir).exists() {
+                                panic!(
+                                    "OpenSSL include directory does not exist: {}",
+                                    inc_dir.to_string_lossy()
+                                );
+                            }
+
+                            use_openssl = true;
+                            (lib_dir, inc_dir)
+                        }
+                    },
+                };
+
+                if cfg!(feature = "bundled-sqlcipher-vendored-openssl") {
+                    cfg.include(env::var("DEP_OPENSSL_INCLUDE").unwrap());
+                    // cargo will resolve downstream to the static lib in
+                    // openssl-sys
+                } else if use_openssl {
+                    cfg.include(inc_dir.to_string_lossy().as_ref());
+                    let lib_name = if is_windows { "libcrypto" } else { "crypto" };
+                    println!("cargo:rustc-link-lib=dylib={lib_name}");
+                    for lib_dir_item in &lib_dir {
+                        println!("cargo:rustc-link-search={}", lib_dir_item.to_string_lossy());
+                    }
+                } else if is_apple {
+                    cfg.flag("-DSQLCIPHER_CRYPTO_CC");
+                    println!("cargo:rustc-link-lib=framework=Security");
+                    println!("cargo:rustc-link-lib=framework=CoreFoundation");
+                } else {
+                    // branch not taken on Windows, just `crypto` is fine.
+                    println!("cargo:rustc-link-lib=dylib=crypto");
                 }
-            } else if is_apple {
-                cfg.flag("-DSQLCIPHER_CRYPTO_CC");
-                println!("cargo:rustc-link-lib=framework=Security");
-                println!("cargo:rustc-link-lib=framework=CoreFoundation");
-            } else {
-                // branch not taken on Windows, just `crypto` is fine.
-                println!("cargo:rustc-link-lib=dylib=crypto");
             }
         }
 
@@ -333,9 +383,38 @@ mod build_bundled {
 
         cfg.compile(lib_name);
 
+        // Emit dependencies after the SQLCipher archive for one-pass linkers.
+        #[cfg(feature = "bundled-sqlcipher-openssl4")]
+        {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                openssl_artifacts.lib_dir().display()
+            );
+            // MSVC names this libcrypto, while Unix names it crypto. Retain
+            // this crate's SQLCipher include metadata, and link only crypto.
+            let crypto = openssl_artifacts
+                .libs()
+                .iter()
+                .find(|name| name.ends_with("crypto"))
+                .expect("openssl-src must provide a static crypto library");
+            println!("cargo:rustc-link-lib=static={crypto}");
+            if openssl_artifacts.needs_latomic() {
+                println!("cargo:rustc-link-lib=atomic");
+            }
+            if win_target() {
+                for library in ["crypt32", "ws2_32", "advapi32", "user32", "gdi32"] {
+                    println!("cargo:rustc-link-lib={library}");
+                }
+            }
+            if super::android_target() {
+                println!("cargo:rustc-link-lib=log");
+            }
+        }
+
         println!("cargo:lib_dir={out_dir}");
     }
 
+    #[cfg(not(feature = "bundled-sqlcipher-openssl4"))]
     fn env(name: &str) -> Option<OsString> {
         let prefix = env::var("TARGET").unwrap().to_uppercase().replace('-', "_");
         let prefixed = format!("{prefix}_{name}");
@@ -347,6 +426,7 @@ mod build_bundled {
         }
     }
 
+    #[cfg(not(feature = "bundled-sqlcipher-openssl4"))]
     fn find_openssl_dir(_host: &str, _target: &str) -> Option<PathBuf> {
         let openssl_dir = env("OPENSSL_DIR");
         openssl_dir.map(PathBuf::from)
